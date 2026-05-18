@@ -1,8 +1,8 @@
 """
-FastAPI application for document extraction via DeepSeek AI.
+FastAPI application for document extraction via GPT-4o-mini.
 
 Provides a /extract endpoint that accepts PDF/image uploads, validates them,
-caches results by content hash, and returns structured JSON via DeepSeek.
+caches results by content hash, and returns structured JSON via AI vision.
 """
 
 import asyncio
@@ -12,7 +12,6 @@ import os
 import time
 import uuid
 from collections import OrderedDict
-from threading import Lock
 from typing import Optional
 
 import fitz  # pymupdf — used for PDF validation
@@ -41,14 +40,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Startup validation — fail fast if DEEPSEEK_API_KEY is missing
+# Startup validation — fail fast if OPENAI_API_KEY is missing
 # ---------------------------------------------------------------------------
-_ds_key = os.environ.get("DEEPSEEK_API_KEY", "")
-if not _ds_key:
+_api_key = os.environ.get("OPENAI_API_KEY", "")
+if not _api_key:
     raise RuntimeError(
-        "DEEPSEEK_API_KEY is missing or empty. "
+        "OPENAI_API_KEY is missing or empty. "
         "Set it in your .env file or environment before starting the server."
     )
+
+# ---------------------------------------------------------------------------
+# Validation constants — must be defined before middleware that references them
+# ---------------------------------------------------------------------------
+ALLOWED_EXTENSIONS = {"pdf", "png", "jpg", "jpeg"}
+ALLOWED_MIME_TYPES = {"application/pdf", "image/png", "image/jpeg"}
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 # ---------------------------------------------------------------------------
 # FastAPI application
@@ -98,29 +104,22 @@ _semaphore = asyncio.Semaphore(5)
 _semaphore_timeout = float(os.environ.get("SEMAPHORE_TIMEOUT_SECONDS", "30"))
 
 # ---------------------------------------------------------------------------
-# Validation constants
-# ---------------------------------------------------------------------------
-ALLOWED_EXTENSIONS = {"pdf", "png", "jpg", "jpeg"}
-ALLOWED_MIME_TYPES = {"application/pdf", "image/png", "image/jpeg"}
-MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
-
-# ---------------------------------------------------------------------------
 # Response cache — keyed by MD5 hash of file content, with LRU eviction
 # ---------------------------------------------------------------------------
 _cache_max_size = int(os.environ.get("CACHE_MAX_SIZE", "100"))
 _cache: OrderedDict[str, ExtractionResponse] = OrderedDict()
-_cache_lock = Lock()
+_cache_lock = asyncio.Lock()
 
 
-def _cache_get(file_hash: str) -> Optional[ExtractionResponse]:
+async def _cache_get(file_hash: str) -> Optional[ExtractionResponse]:
     """Retrieve a cached extraction result by file hash. Returns None on miss."""
-    with _cache_lock:
+    async with _cache_lock:
         return _cache.get(file_hash)
 
 
-def _cache_set(file_hash: str, result: ExtractionResponse) -> None:
+async def _cache_set(file_hash: str, result: ExtractionResponse) -> None:
     """Store an extraction result in the cache, evicting oldest if at capacity."""
-    with _cache_lock:
+    async with _cache_lock:
         if file_hash in _cache:
             # Move to end (most recently used)
             _cache.move_to_end(file_hash)
@@ -155,7 +154,7 @@ async def extract(file: UploadFile = File(...)):
     Upload a PDF or image document and receive structured extraction JSON.
 
     The file is validated by extension, magic bytes, and size before
-    being sent to the DeepSeek API for AI-powered data extraction.
+    being sent to the AI model for data extraction.
     """
     request_id = str(uuid.uuid4())
     start_time = time.time()
@@ -277,7 +276,7 @@ async def extract(file: UploadFile = File(...)):
 
     # ---- Step 6: Check cache ----
     file_hash = _hash_content(file_data)
-    cached = _cache_get(file_hash)
+    cached = await _cache_get(file_hash)
     if cached is not None:
         elapsed_ms = (time.time() - start_time) * 1000
         logger.info(
@@ -324,7 +323,7 @@ async def extract(file: UploadFile = File(...)):
                 detail="Server busy, please retry shortly",
             )
 
-        # ---- Step 8: Call DeepSeek extraction ----
+        # ---- Step 8: Call extraction ----
         try:
             extraction_result, prompt_tokens, completion_tokens = extract_document(
                 file_data=file_data,
@@ -352,7 +351,7 @@ async def extract(file: UploadFile = File(...)):
             )
 
         # ---- Step 9: Store in cache ----
-        _cache_set(file_hash, extraction_result)
+        await _cache_set(file_hash, extraction_result)
 
         # ---- Step 10: Log success metrics ----
         elapsed_ms = (time.time() - start_time) * 1000

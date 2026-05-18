@@ -1,13 +1,14 @@
 """
-DeepSeek API integration for document data extraction.
+OpenAI GPT-4o-mini integration for document data extraction.
 
-Pipeline: render PDF/images to pixel data → OCR with pytesseract →
-send extracted text to DeepSeek for structured JSON extraction.
+Handles PDF page rendering, image encoding, prompt construction,
+API communication, and response parsing with retry logic.
 
-DeepSeek's API is text-only, so we use OCR as the bridge from
-visual documents to the LLM.
+Uses gpt-4o-mini's vision capabilities to extract structured data
+directly from document images — no OCR step needed.
 """
 
+import base64
 import io
 import json
 import logging
@@ -16,7 +17,6 @@ import time
 from typing import Optional
 
 import fitz  # pymupdf
-import pytesseract
 from openai import OpenAI
 from PIL import Image
 
@@ -24,69 +24,61 @@ from models import ExtractionResponse
 
 logger = logging.getLogger(__name__)
 
-DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-chat"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+MODEL_NAME = "gpt-4o-mini"
 
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 1.0
 
-# Token pricing for deepseek-chat (per 1M tokens, input / output).
-# Source: https://api-docs.deepseek.com/quick_start/pricing
-PRICE_PER_1M_PROMPT_TOKENS = 0.27  # USD (cache miss)
-PRICE_PER_1M_COMPLETION_TOKENS = 1.10  # USD
+# Token pricing for gpt-4o-mini (per 1M tokens, input / output).
+# Source: https://openai.com/api/pricing/
+PRICE_PER_1M_INPUT_TOKENS = 0.15  # USD
+PRICE_PER_1M_OUTPUT_TOKENS = 0.60  # USD
 
-EXTRACTION_SYSTEM_PROMPT = (
+EXTRACTION_PROMPT = (
     "You are a document data extraction engine. Your sole purpose is to examine "
-    "the provided OCR-extracted text from a document and extract all key fields "
-    "into a clean, valid JSON object. You must return ONLY raw JSON — no "
-    "markdown, no backticks, no code fences, no explanations before or after. "
-    "Any output that is not pure JSON will be considered a failure."
-)
-
-EXTRACTION_USER_PROMPT_TEMPLATE = (
-    "Extract the following fields from this OCR text of a document and return "
-    "them as a single JSON object. Use null for any field you cannot find or "
-    "are unsure about. Do not guess — if the value is not clearly present, "
-    "set it to null.\n\n"
-    "Fields to extract:\n"
-    '  "document_type": "invoice | receipt | purchase_order | other"\n'
-    '  "vendor_name": company or individual who issued the document\n'
-    '  "vendor_address": full address of the vendor\n'
-    '  "document_number": invoice number, receipt number, or PO number\n'
-    '  "date": document date as YYYY-MM-DD\n'
-    '  "due_date": payment due date as YYYY-MM-DD if applicable\n'
-    '  "currency": currency code like USD, EUR, GBP\n'
-    '  "subtotal": amount before tax\n'
-    '  "tax_amount": tax amount\n'
-    '  "tax_rate": tax rate as a percentage (e.g. 8.5)\n'
-    '  "total_amount": final total\n'
-    '  "line_items": [{{"description": "...", "quantity": 1.0, "unit_price": 50.00, "total": 50.00}}]\n'
-    '  "payment_terms": e.g. Net 30, Due on Receipt\n'
-    '  "notes": any additional notes or comments\n\n'
-    "OCR-extracted document text:\n"
-    "{ocr_text}\n\n"
+    "the provided document image and extract all key fields into a clean, valid "
+    "JSON object. You must return ONLY raw JSON — no markdown, no backticks, "
+    "no code fences, no explanations before or after. Any output that is not "
+    "pure JSON will be considered a failure.\n\n"
+    "Extract the following fields from this document image and return them as a "
+    "single JSON object. Use null for any field you cannot find or are unsure about. "
+    "Do not guess — if the value is not clearly present, set it to null.\n\n"
+    "{\n"
+    '  "document_type": "invoice | receipt | purchase_order | other",\n'
+    '  "vendor_name": "Company Name",\n'
+    '  "vendor_address": "123 Main St, City, Country",\n'
+    '  "document_number": "INV-12345",\n'
+    '  "date": "YYYY-MM-DD",\n'
+    '  "due_date": "YYYY-MM-DD",\n'
+    '  "currency": "USD",\n'
+    '  "subtotal": 100.00,\n'
+    '  "tax_amount": 8.50,\n'
+    '  "tax_rate": 8.5,\n'
+    '  "total_amount": 108.50,\n'
+    '  "line_items": [\n'
+    '    {"description": "Item name", "quantity": 1.0, "unit_price": 50.00, "total": 50.00}\n'
+    '  ],\n'
+    '  "payment_terms": "Net 30",\n'
+    '  "notes": "Any additional notes"\n'
+    "}\n\n"
     "Return ONLY the JSON object, nothing else."
 )
 
 
 def _get_client() -> OpenAI:
-    """Create a configured OpenAI client pointed at the DeepSeek API."""
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    return OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+    """Create a configured OpenAI client pointed at the standard API."""
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    return OpenAI(api_key=api_key, base_url=OPENAI_BASE_URL)
 
 
-def _ocr_image(pil_image: Image.Image) -> str:
-    """Run pytesseract OCR on a PIL Image and return the extracted text."""
-    try:
-        text = pytesseract.image_to_string(pil_image)
-        return text.strip()
-    except Exception as exc:
-        raise ValueError(f"OCR failed: {exc}") from exc
-
-
-def _extract_text_from_pdf(file_data: bytes) -> str:
+def _render_pdf_page_to_png(file_data: bytes) -> bytes:
     """
-    Render the first page of a PDF to an image at 2x scale and run OCR.
+    Render the first page of a PDF to PNG bytes at 2x scale.
+
+    After rendering, if either pixel dimension exceeds 4096px the image
+    is scaled down proportionally via Pillow so the longest axis is at
+    most 4096px. This prevents memory exhaustion from large-format PDFs.
 
     Raises ValueError if the PDF cannot be opened, has no pages, or
     rendering fails.
@@ -102,25 +94,38 @@ def _extract_text_from_pdf(file_data: bytes) -> str:
 
     try:
         page = doc.load_page(0)
-        # Render at 2x scale for better OCR accuracy
+        # Render at 2x scale for better vision quality
         matrix = fitz.Matrix(2, 2)
         pix = page.get_pixmap(matrix=matrix)
         pil_image = Image.open(io.BytesIO(pix.tobytes("png")))
+
+        # Pixel budget check — scale down if either axis exceeds 4096px.
+        # Large-format vector PDFs can produce multi-megapixel renders at 2x.
+        if pil_image.width > 4096 or pil_image.height > 4096:
+            scale = 4096 / max(pil_image.width, pil_image.height)
+            new_size = (int(pil_image.width * scale), int(pil_image.height * scale))
+            logger.warning(
+                "PDF page oversized after 2x render (%dx%d), scaling to %dx%d",
+                pil_image.width,
+                pil_image.height,
+                new_size[0],
+                new_size[1],
+            )
+            pil_image = pil_image.resize(new_size, Image.LANCZOS)
+
+        # Encode the (possibly scaled) image as PNG bytes
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        return buf.getvalue()
     except Exception as exc:
         raise ValueError(f"Failed to render PDF page to image: {exc}") from exc
     finally:
         doc.close()
 
-    return _ocr_image(pil_image)
 
-
-def _extract_text_from_image(file_data: bytes) -> str:
-    """Run OCR directly on image bytes (PNG or JPEG)."""
-    try:
-        pil_image = Image.open(io.BytesIO(file_data))
-    except Exception as exc:
-        raise ValueError(f"Failed to open image: {exc}") from exc
-    return _ocr_image(pil_image)
+def _encode_image_to_base64(file_data: bytes) -> str:
+    """Encode raw image bytes directly to a base64 string (no re-processing)."""
+    return base64.b64encode(file_data).decode("utf-8")
 
 
 def _strip_bom_and_whitespace(text: str) -> str:
@@ -142,18 +147,18 @@ def _parse_json_response(raw_text: str, request_id: str) -> dict:
     """
     cleaned = _strip_bom_and_whitespace(raw_text)
     if not cleaned:
-        raise ValueError("Empty response from DeepSeek after cleaning")
+        raise ValueError("Empty response from model after cleaning")
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"DeepSeek returned invalid JSON: {exc}") from exc
+        raise ValueError(f"Model returned invalid JSON: {exc}") from exc
 
 
 def compute_cost(prompt_tokens: int, completion_tokens: int) -> float:
-    """Compute estimated cost in USD based on DeepSeek token pricing."""
-    prompt_cost = (prompt_tokens / 1_000_000) * PRICE_PER_1M_PROMPT_TOKENS
-    completion_cost = (completion_tokens / 1_000_000) * PRICE_PER_1M_COMPLETION_TOKENS
-    return round(prompt_cost + completion_cost, 6)
+    """Compute estimated cost in USD based on gpt-4o-mini token pricing."""
+    input_cost = (prompt_tokens / 1_000_000) * PRICE_PER_1M_INPUT_TOKENS
+    output_cost = (completion_tokens / 1_000_000) * PRICE_PER_1M_OUTPUT_TOKENS
+    return round(input_cost + output_cost, 6)
 
 
 def extract_document(
@@ -162,7 +167,7 @@ def extract_document(
     request_id: str,
 ) -> tuple[ExtractionResponse, int, int]:
     """
-    OCR the document then send extracted text to DeepSeek for structuring.
+    Send a document image to gpt-4o-mini for structured extraction.
 
     Args:
         file_data: Raw file bytes (PDF or image).
@@ -175,34 +180,23 @@ def extract_document(
     Raises ValueError after exhausting all retries if extraction or
     validation fails.
     """
-    # Step 1: OCR the document
-    try:
-        if mime_type == "application/pdf":
-            ocr_text = _extract_text_from_pdf(file_data)
-        elif mime_type in ("image/png", "image/jpeg"):
-            ocr_text = _extract_text_from_image(file_data)
-        else:
-            # This branch is intentionally unreachable in production because
-            # main.py filters MIME types to the allowed set before calling
-            # extract_document.  It exists as a defensive guard in case this
-            # function is ever called from another context.
-            raise ValueError(f"Unsupported MIME type for extraction: {mime_type}")
-    except ValueError:
-        raise
-    except Exception as exc:
-        raise ValueError(f"Document OCR failed: {exc}") from exc
+    # Step 1: Prepare the base64 image payload
+    if mime_type == "application/pdf":
+        png_bytes = _render_pdf_page_to_png(file_data)
+        base64_image = base64.b64encode(png_bytes).decode("utf-8")
+        image_mime = "image/png"
+    elif mime_type in ("image/png", "image/jpeg"):
+        base64_image = _encode_image_to_base64(file_data)
+        # JPEG is accepted as image/jpeg in data URIs
+        image_mime = mime_type
+    else:
+        # This branch is intentionally unreachable in production because
+        # main.py filters MIME types to the allowed set before calling
+        # extract_document.  It exists as a defensive guard in case this
+        # function is ever called from another context.
+        raise ValueError(f"Unsupported MIME type for extraction: {mime_type}")
 
-    if not ocr_text:
-        raise ValueError("OCR produced no text — document may be blank or unreadable")
-
-    logger.info(
-        "OCR complete | request_id=%s | ocr_chars=%d",
-        request_id,
-        len(ocr_text),
-    )
-
-    # Step 2: Build the extraction prompt with the OCR text
-    prompt = EXTRACTION_USER_PROMPT_TEMPLATE.format(ocr_text=ocr_text)
+    data_uri = f"data:{image_mime};base64,{base64_image}"
 
     client = _get_client()
     last_error: Optional[Exception] = None
@@ -210,17 +204,28 @@ def extract_document(
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             logger.info(
-                "DeepSeek extraction attempt %d/%d | request_id=%s",
+                "GPT-4o-mini extraction attempt %d/%d | request_id=%s",
                 attempt,
                 MAX_RETRIES,
                 request_id,
             )
 
             response = client.chat.completions.create(
-                model=DEEPSEEK_MODEL,
+                model=MODEL_NAME,
                 messages=[
-                    {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_uri},
+                            },
+                            {
+                                "type": "text",
+                                "text": EXTRACTION_PROMPT,
+                            },
+                        ],
+                    },
                 ],
                 temperature=0.0,  # Deterministic output for structured extraction
                 max_tokens=4096,
@@ -229,12 +234,12 @@ def extract_document(
             # Guard against empty or missing choices (transient API glitch).
             if not response.choices:
                 logger.warning(
-                    "DeepSeek returned empty choices list on attempt %d/%d | request_id=%s",
+                    "Model returned empty choices list on attempt %d/%d | request_id=%s",
                     attempt,
                     MAX_RETRIES,
                     request_id,
                 )
-                raise ValueError("DeepSeek returned empty choices list")
+                raise ValueError("Model returned empty choices list")
 
             raw_content = response.choices[0].message.content or ""
             prompt_tokens = response.usage.prompt_tokens if response.usage else 0
@@ -264,7 +269,7 @@ def extract_document(
         except Exception as exc:
             # Unexpected errors (network, auth, etc.) — do not retry
             logger.error(
-                "Unexpected DeepSeek API error for request_id=%s: %s",
+                "Unexpected API error for request_id=%s: %s",
                 request_id,
                 exc,
             )

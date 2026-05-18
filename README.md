@@ -1,6 +1,6 @@
 # Document Extractor API
 
-A Python FastAPI server that accepts PDF or image document uploads, sends them to the DeepSeek AI API for vision-based data extraction, and returns clean structured JSON containing all key fields (vendor, date, total, line items, tax, currency, etc.).
+A Python FastAPI server that accepts PDF or image document uploads, sends document images directly to GPT-4o-mini for AI-powered field extraction, and returns clean structured JSON containing all key fields (vendor, date, total, line items, tax, currency, etc.).
 
 Designed for listing on RapidAPI.
 
@@ -25,6 +25,7 @@ Designed for listing on RapidAPI.
 
 - Python 3.11+
 - **libmagic** (system package, required by `python-magic`)
+- No additional system dependencies required for AI extraction — uses OpenAI API directly
 
 ### Installing libmagic
 
@@ -68,13 +69,13 @@ sudo dnf install file-libs
     cp .env.example .env
     ```
 
-    Edit `.env` and fill in your DeepSeek API key:
+    Edit `.env` and fill in your OpenAI API key:
     ```
-    DEEPSEEK_API_KEY=sk-your-deepseek-api-key
+    OPENAI_API_KEY=sk-your-openai-api-key
     CACHE_MAX_SIZE=100
     ```
 
-    Get your API key at [platform.deepseek.com](https://platform.deepseek.com/api_keys).
+    Get your API key at [platform.openai.com/api-keys](https://platform.openai.com/api-keys).
 
 ---
 
@@ -89,7 +90,7 @@ Or use the built-in entry point:
 python main.py
 ```
 
-The server will refuse to start if `DEEPSEEK_API_KEY` is missing or empty.
+The server will refuse to start if `OPENAI_API_KEY` is missing or empty.
 
 Verify it's running:
 ```bash
@@ -164,7 +165,7 @@ curl -X POST http://localhost:8000/extract \
 | Status | Meaning |
 |--------|---------|
 | 400 | Bad input — invalid extension, MIME mismatch, file too large, empty/corrupt PDF |
-| 422 | Validation failure — DeepSeek returned data that failed schema validation |
+| 422 | Validation failure — AI model returned data that failed schema validation |
 | 503 | Server busy — all 5 extraction slots are occupied, retry shortly |
 | 500 | Unexpected internal error |
 
@@ -174,27 +175,28 @@ curl -X POST http://localhost:8000/extract \
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DEEPSEEK_API_KEY` | **Yes** | — | Your DeepSeek API key (starts with `sk-`) |
+| `OPENAI_API_KEY` | **Yes** | — | Your OpenAI API key (starts with `sk-`) |
 | `CACHE_MAX_SIZE` | No | `100` | Maximum number of cached extraction results |
+| `SEMAPHORE_TIMEOUT_SECONDS` | No | `30` | Max seconds to wait for a free extraction slot |
 
 ---
 
 ## Cost Estimation
 
-DeepSeek-chat pricing (as of 2024):
+gpt-4o-mini pricing (as of 2025):
 
 | Token Type | Price per 1M tokens |
 |------------|---------------------|
-| Input (prompt) | $0.27 |
-| Output (completion) | $1.10 |
+| Input | $0.15 |
+| Output | $0.60 |
 
 **Typical per-request costs:**
 
 | Document Type | Input Tokens | Output Tokens | Estimated Cost |
 |---------------|-------------|---------------|----------------|
-| Simple receipt | ~800 | ~200 | ~$0.00044 |
-| Standard invoice | ~1,200 | ~350 | ~$0.00071 |
-| Complex multi-page invoice | ~1,800 | ~600 | ~$0.00115 |
+| Simple receipt | ~800 | ~200 | ~$0.00024 |
+| Standard invoice | ~1,200 | ~350 | ~$0.00039 |
+| Complex multi-page invoice | ~1,800 | ~600 | ~$0.00063 |
 
 Cost per request is logged alongside every extraction for monitoring.
 
@@ -205,7 +207,7 @@ Cost per request is logged alongside every extraction for monitoring.
 ```
 document-extractor/
 ├── main.py            # FastAPI app, endpoints, validation, caching
-├── extractor.py       # DeepSeek API integration, image encoding, retry logic
+├── extractor.py       # GPT-4o-mini vision API integration, image rendering, retry logic
 ├── models.py          # Pydantic v2 response schemas with dynamic confidence scoring
 ├── requirements.txt   # Pinned Python dependencies
 ├── .env.example       # Environment variable template

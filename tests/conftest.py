@@ -20,10 +20,10 @@ from models import ExtractionResponse
 
 # ---------------------------------------------------------------------------
 # Module-level environment setup — MUST run before any test imports main.py
-# because main.py validates DEEPSEEK_API_KEY at import time.  These prevent
+# because main.py validates OPENAI_API_KEY at import time.  These prevent
 # accidental real API calls and set a short semaphore timeout for testing.
 # ---------------------------------------------------------------------------
-os.environ["DEEPSEEK_API_KEY"] = "sk-test-fake-key-for-testing"
+os.environ["OPENAI_API_KEY"] = "sk-test-fake-key-for-testing"
 os.environ["SEMAPHORE_TIMEOUT_SECONDS"] = "0.5"
 
 
@@ -65,7 +65,7 @@ def valid_extraction_response():
 # ---------------------------------------------------------------------------
 @pytest.fixture
 def minimal_pdf_bytes():
-    """A minimal valid single-page PDF with visible text for OCR."""
+    """A minimal valid single-page PDF with visible text."""
     doc = fitz.open()
     page = doc.new_page(width=612, height=792)
     page.insert_text((50, 50), "INVOICE", fontsize=20)
@@ -80,11 +80,10 @@ def minimal_pdf_bytes():
 
 @pytest.fixture
 def minimal_png_bytes():
-    """A small PNG image with visible text for OCR."""
-    from PIL import ImageDraw, ImageFont
+    """A small PNG image with visible text."""
+    from PIL import ImageDraw
     img = Image.new("RGB", (400, 200), color="white")
     draw = ImageDraw.Draw(img)
-    # Use default font
     draw.text((20, 20), "INVOICE", fill="black")
     draw.text((20, 50), "Vendor: Test Corp", fill="black")
     draw.text((20, 80), "Total: $100.00", fill="black")
@@ -95,7 +94,7 @@ def minimal_png_bytes():
 
 @pytest.fixture
 def minimal_jpg_bytes():
-    """A small JPEG image with visible text for OCR."""
+    """A small JPEG image with visible text."""
     from PIL import ImageDraw
     img = Image.new("RGB", (400, 200), color="white")
     draw = ImageDraw.Draw(img)
@@ -108,9 +107,22 @@ def minimal_jpg_bytes():
 
 
 @pytest.fixture
+def oversized_pdf_bytes():
+    """
+    A PDF with a page large enough that rendering at 2x exceeds 4096px
+    (2500pt x 2 = 5000px), triggering the Pillow downscale path.
+    """
+    doc = fitz.open()
+    doc.new_page(width=2500, height=2500)
+    buf = io.BytesIO()
+    doc.save(buf)
+    doc.close()
+    return buf.getvalue()
+
+
+@pytest.fixture
 def empty_pdf_bytes():
     """A valid PDF structure with zero pages (Count 0)."""
-    # Hand-crafted minimal PDF — pymupdf won't .save() a zero-page doc.
     return (
         b"%PDF-1.4\n"
         b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"

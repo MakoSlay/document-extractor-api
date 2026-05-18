@@ -3,7 +3,7 @@ Integration tests for main.py.
 
 Uses FastAPI TestClient and mocks extract_document at the function level
 to test the full HTTP layer: validation, error codes, caching, and the
-semaphore gate — without real DeepSeek calls.
+semaphore gate — without real API calls.
 """
 
 import asyncio
