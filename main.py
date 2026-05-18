@@ -91,7 +91,7 @@ async def content_length_middleware(request: Request, call_next):
                     )
                     return JSONResponse(
                         status_code=400,
-                        content={"detail": f"File size exceeds the 10 MB limit"},
+                        content={"detail": "File size exceeds the 10 MB limit"},
                     )
             except ValueError:
                 pass  # Malformed header — let the body-read check handle it
@@ -310,7 +310,7 @@ async def extract(file: UploadFile = File(...)):
                 _semaphore_timeout,
                 request_id,
             )
-        except Exception as exc:
+        except Exception:
             acquired = False
             logger.exception(
                 "Semaphore acquire failed unexpectedly | request_id=%s",
@@ -340,7 +340,7 @@ async def extract(file: UploadFile = File(...)):
                 status_code=422,
                 detail=str(exc),
             )
-        except Exception as exc:
+        except Exception:
             logger.exception(
                 "Unexpected extraction error | request_id=%s",
                 request_id,
@@ -375,7 +375,7 @@ async def extract(file: UploadFile = File(...)):
 
     except HTTPException:
         raise
-    except Exception as exc:
+    except Exception:
         logger.exception("Unhandled error | request_id=%s", request_id)
         raise HTTPException(
             status_code=500,

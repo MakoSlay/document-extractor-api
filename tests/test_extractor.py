@@ -287,16 +287,47 @@ def test_normal_pdf_not_scaled(minimal_pdf_bytes):
 
 
 # ---------------------------------------------------------------------------
-# Tests: image encoding
+# Tests: image encoding (with pixel budget)
 # ---------------------------------------------------------------------------
 def test_image_encode_to_base64(minimal_png_bytes):
-    """PNG image bytes are encoded directly to base64 string."""
+    """PNG image bytes are resaved as PNG and base64-encoded."""
     b64 = extractor._encode_image_to_base64(minimal_png_bytes)
     assert isinstance(b64, str)
     assert len(b64) > 0
-    # Decode should return the original bytes (no re-processing through Pillow)
+
+    # Output should be a valid PNG (always re-encoded to PNG)
+    import base64
     decoded = base64.b64decode(b64)
-    assert decoded == minimal_png_bytes
+    img = PILImage.open(io.BytesIO(decoded))
+    assert img.format == "PNG"
+    # Small 400x200 image should not be resized
+    assert img.width == 400
+    assert img.height == 200
+
+
+def test_oversized_image_gets_scaled():
+    """A 5000x5000 image should be scaled down to 4096px max."""
+    img = PILImage.new("RGB", (5000, 5000), color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    big_png = buf.getvalue()
+
+    b64 = extractor._encode_image_to_base64(big_png)
+    decoded = base64.b64decode(b64)
+    result = PILImage.open(io.BytesIO(decoded))
+    assert result.width <= 4096
+    assert result.height <= 4096
+    # Should be 4096 on the longest axis
+    assert result.width == 4096
+    assert result.height == 4096
+
+
+def test_jpeg_gets_reencoded_to_png(minimal_jpg_bytes):
+    """JPEG input is re-encoded to PNG output."""
+    b64 = extractor._encode_image_to_base64(minimal_jpg_bytes)
+    decoded = base64.b64decode(b64)
+    img = PILImage.open(io.BytesIO(decoded))
+    assert img.format == "PNG"
 
 
 # ---------------------------------------------------------------------------

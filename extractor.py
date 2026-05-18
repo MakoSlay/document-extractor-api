@@ -124,8 +124,32 @@ def _render_pdf_page_to_png(file_data: bytes) -> bytes:
 
 
 def _encode_image_to_base64(file_data: bytes) -> str:
-    """Encode raw image bytes directly to a base64 string (no re-processing)."""
-    return base64.b64encode(file_data).decode("utf-8")
+    """
+    Open image bytes, apply the 4096px pixel budget cap if needed, then
+    encode to a base64 PNG data URI string.
+
+    Always re-encodes to PNG for consistent output regardless of input format.
+    """
+    pil_image = Image.open(io.BytesIO(file_data))
+
+    # Apply the same pixel budget check that PDFs get — scale down if
+    # either axis exceeds 4096px.
+    if pil_image.width > 4096 or pil_image.height > 4096:
+        scale = 4096 / max(pil_image.width, pil_image.height)
+        new_size = (int(pil_image.width * scale), int(pil_image.height * scale))
+        logger.warning(
+            "Uploaded image oversized (%dx%d), scaling to %dx%d",
+            pil_image.width,
+            pil_image.height,
+            new_size[0],
+            new_size[1],
+        )
+        pil_image = pil_image.resize(new_size, Image.LANCZOS)
+
+    # Always encode as PNG for the API (consistent, lossless)
+    buf = io.BytesIO()
+    pil_image.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 def _strip_bom_and_whitespace(text: str) -> str:
@@ -187,8 +211,8 @@ def extract_document(
         image_mime = "image/png"
     elif mime_type in ("image/png", "image/jpeg"):
         base64_image = _encode_image_to_base64(file_data)
-        # JPEG is accepted as image/jpeg in data URIs
-        image_mime = mime_type
+        # Always output as PNG after potential resize
+        image_mime = "image/png"
     else:
         # This branch is intentionally unreachable in production because
         # main.py filters MIME types to the allowed set before calling
