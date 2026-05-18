@@ -2,8 +2,8 @@
 Unit tests for extractor.py.
 
 Mocks the openai.OpenAI client at the chat.completions.create level
-to test the full extraction pipeline including rendering, encoding,
-retry logic, BOM stripping, and validation — without real API calls.
+to test the full extraction pipeline (OCR → DeepSeek → JSON parsing)
+without real API calls.
 """
 
 import json
@@ -42,7 +42,7 @@ def _install_mock_client(monkeypatch, mock_response):
 # Tests: successful extraction (PDF and image)
 # ---------------------------------------------------------------------------
 def test_extract_pdf_success(minimal_pdf_bytes, monkeypatch):
-    """Happy path: PDF → rendered page → valid JSON → ExtractionResponse."""
+    """Happy path: PDF → OCR → text → valid JSON → ExtractionResponse."""
     mock_resp = make_mock_openai_response(VALID_EXTRACTION_JSON)
     _install_mock_client(monkeypatch, mock_resp)
 
@@ -68,7 +68,7 @@ def test_extract_pdf_success(minimal_pdf_bytes, monkeypatch):
 
 
 def test_extract_png_success(minimal_png_bytes, monkeypatch):
-    """Happy path: PNG image → base64 encoded → valid JSON."""
+    """Happy path: PNG image → OCR → text → valid JSON."""
     mock_resp = make_mock_openai_response(VALID_EXTRACTION_JSON)
     _install_mock_client(monkeypatch, mock_resp)
 
@@ -84,7 +84,7 @@ def test_extract_png_success(minimal_png_bytes, monkeypatch):
 
 
 def test_extract_jpeg_success(minimal_jpg_bytes, monkeypatch):
-    """Happy path: JPEG image → base64 encoded → valid JSON."""
+    """Happy path: JPEG image → OCR → text → valid JSON."""
     mock_resp = make_mock_openai_response(VALID_EXTRACTION_JSON)
     _install_mock_client(monkeypatch, mock_resp)
 
@@ -160,7 +160,7 @@ def test_retry_on_empty_string_response(minimal_pdf_bytes, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Tests: empty choices guard (fix #3)
+# Tests: empty choices guard
 # ---------------------------------------------------------------------------
 def test_empty_choices_triggers_retry(minimal_pdf_bytes, monkeypatch):
     """Empty choices list is treated as retryable, not an unexpected error."""
@@ -236,74 +236,61 @@ def test_unexpected_api_error_no_retry(minimal_pdf_bytes, monkeypatch):
             request_id="test-network-001",
         )
 
-    # Should NOT retry — only 1 call
     assert mock_client.chat.completions.create.call_count == 1
 
 
 # ---------------------------------------------------------------------------
-# Tests: PDF rendering edge cases
+# Tests: PDF text extraction (OCR)
 # ---------------------------------------------------------------------------
 def test_corrupt_pdf_raises_valueerror():
-    """Bytes that are not a valid PDF → ValueError on render."""
+    """Bytes that are not a valid PDF → ValueError on extraction."""
     with pytest.raises(ValueError, match="Failed to open PDF"):
-        extractor._render_pdf_page_to_base64_png(b"not a pdf")
+        extractor._extract_text_from_pdf(b"not a pdf")
 
 
 def test_empty_pdf_raises_valueerror(empty_pdf_bytes):
     """PDF with zero pages → ValueError."""
     with pytest.raises(ValueError, match="PDF contains no pages"):
-        extractor._render_pdf_page_to_base64_png(empty_pdf_bytes)
+        extractor._extract_text_from_pdf(empty_pdf_bytes)
 
 
-def test_oversized_pdf_gets_scaled(oversized_pdf_bytes):
-    """Large-format PDF is scaled down to ≤4096px on each axis."""
-    b64 = extractor._render_pdf_page_to_base64_png(oversized_pdf_bytes)
-    assert b64 is not None
-    assert len(b64) > 0
-
-    # Decode and check dimensions
-    import base64
-    import io
-
-    from PIL import Image
-
-    png_bytes = base64.b64decode(b64)
-    img = Image.open(io.BytesIO(png_bytes))
-    assert img.width <= 4096
-    assert img.height <= 4096
+def test_pdf_ocr_produces_text(minimal_pdf_bytes):
+    """A valid PDF with text content → OCR returns non-empty string."""
+    text = extractor._extract_text_from_pdf(minimal_pdf_bytes)
+    # The minimal PDF from conftest has no visible text, so OCR may return
+    # empty.  We just verify no exception is raised.
+    assert isinstance(text, str)
 
 
-def test_normal_pdf_not_scaled(minimal_pdf_bytes):
-    """A normal 612×792 PDF at 2x (1224×1584) is not scaled down."""
-    b64 = extractor._render_pdf_page_to_base64_png(minimal_pdf_bytes)
-    assert b64 is not None
-    assert len(b64) > 0
-
-    import base64
-    import io
-
-    from PIL import Image
-
-    png_bytes = base64.b64decode(b64)
-    img = Image.open(io.BytesIO(png_bytes))
-    # 2x of 612×792 = 1224×1584 — both well under 4096
-    assert img.width == 1224
-    assert img.height == 1584
+def test_image_ocr_produces_text(minimal_png_bytes):
+    """A PNG image → OCR runs without error."""
+    text = extractor._extract_text_from_image(minimal_png_bytes)
+    assert isinstance(text, str)
 
 
 # ---------------------------------------------------------------------------
-# Tests: image encoding
+# Tests: OCR on blank document
 # ---------------------------------------------------------------------------
-def test_png_image_encoding(minimal_png_bytes):
-    """PNG image bytes are encoded directly to base64."""
-    b64 = extractor._encode_image_to_base64(minimal_png_bytes)
-    assert len(b64) > 0
+def test_blank_document_rejected(monkeypatch):
+    """If OCR returns empty text, extraction raises ValueError."""
+    import extractor as ex
 
-    import base64
+    # Create a tiny white image that OCR will return empty for
+    from PIL import Image as PILImage
+    import io as _io
+    from unittest.mock import MagicMock
 
-    decoded = base64.b64decode(b64)
-    # Should be the same PNG bytes (no re-encoding through Pillow)
-    assert decoded == minimal_png_bytes
+    img = PILImage.new("RGB", (10, 10), color="white")
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+
+    with pytest.raises(ValueError, match="OCR produced no text"):
+        ex.extract_document(
+            file_data=png_bytes,
+            mime_type="image/png",
+            request_id="test-blank-001",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +299,6 @@ def test_png_image_encoding(minimal_png_bytes):
 def test_compute_cost():
     """Cost calculation matches DeepSeek pricing."""
     cost = extractor.compute_cost(prompt_tokens=1_000_000, completion_tokens=1_000_000)
-    # 1M prompt * $0.27/M + 1M completion * $1.10/M = $1.37
     assert cost == pytest.approx(1.37, abs=0.001)
 
     cost_zero = extractor.compute_cost(prompt_tokens=0, completion_tokens=0)

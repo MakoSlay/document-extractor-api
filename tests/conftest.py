@@ -65,9 +65,13 @@ def valid_extraction_response():
 # ---------------------------------------------------------------------------
 @pytest.fixture
 def minimal_pdf_bytes():
-    """A minimal but valid single-page PDF that pymupdf can open."""
+    """A minimal valid single-page PDF with visible text for OCR."""
     doc = fitz.open()
-    doc.new_page(width=612, height=792)
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((50, 50), "INVOICE", fontsize=20)
+    page.insert_text((50, 80), "Vendor: Test Corp", fontsize=12)
+    page.insert_text((50, 100), "Total: $100.00", fontsize=12)
+    page.insert_text((50, 120), "Date: 2024-01-15", fontsize=12)
     buf = io.BytesIO()
     doc.save(buf)
     doc.close()
@@ -76,8 +80,14 @@ def minimal_pdf_bytes():
 
 @pytest.fixture
 def minimal_png_bytes():
-    """A small 100x100 PNG image."""
-    img = Image.new("RGB", (100, 100), color="white")
+    """A small PNG image with visible text for OCR."""
+    from PIL import ImageDraw, ImageFont
+    img = Image.new("RGB", (400, 200), color="white")
+    draw = ImageDraw.Draw(img)
+    # Use default font
+    draw.text((20, 20), "INVOICE", fill="black")
+    draw.text((20, 50), "Vendor: Test Corp", fill="black")
+    draw.text((20, 80), "Total: $100.00", fill="black")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -85,25 +95,15 @@ def minimal_png_bytes():
 
 @pytest.fixture
 def minimal_jpg_bytes():
-    """A small 100x100 JPEG image."""
-    img = Image.new("RGB", (100, 100), color="white")
+    """A small JPEG image with visible text for OCR."""
+    from PIL import ImageDraw
+    img = Image.new("RGB", (400, 200), color="white")
+    draw = ImageDraw.Draw(img)
+    draw.text((20, 20), "INVOICE", fill="black")
+    draw.text((20, 50), "Vendor: Test Corp", fill="black")
+    draw.text((20, 80), "Total: $100.00", fill="black")
     buf = io.BytesIO()
     img.save(buf, format="JPEG")
-    return buf.getvalue()
-
-
-@pytest.fixture
-def oversized_pdf_bytes():
-    """
-    A PDF with a page large enough that rendering at 2x exceeds 4096px
-    on both axes (2500pt × 2 / 72 * 72 = 5000px), triggering the
-    Pillow downscale path.
-    """
-    doc = fitz.open()
-    doc.new_page(width=2500, height=2500)
-    buf = io.BytesIO()
-    doc.save(buf)
-    doc.close()
     return buf.getvalue()
 
 
