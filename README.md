@@ -2,7 +2,7 @@
 
 A Python FastAPI server that accepts PDF or image document uploads, sends document images directly to GPT-4o-mini for AI-powered field extraction, and returns clean structured JSON containing all key fields (vendor, date, total, line items, tax, currency, etc.).
 
-Designed for listing on RapidAPI.
+Designed for listing on RapidAPI and deployable on Railway.
 
 ---
 
@@ -81,11 +81,13 @@ sudo dnf install file-libs
 
 ## Running the Server
 
+Recommended local run command:
+
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Or use the built-in entry point:
+You can also use the built-in entry point (it respects `PORT` and defaults to 8000):
 ```bash
 python main.py
 ```
@@ -97,6 +99,12 @@ Verify it's running:
 curl http://localhost:8000/health
 # {"status":"ok"}
 ```
+
+### Worker model
+
+Run this API with **1 worker** in production. The in-memory cache and concurrency
+semaphore are process-local, so multiple workers would multiply concurrent OpenAI
+calls and reduce cache hit rates.
 
 ---
 
@@ -202,6 +210,17 @@ Cost per request is logged alongside every extraction for monitoring.
 
 ---
 
+## Railway Deployment
+
+This repo includes:
+- `railway.toml` — Railway start configuration
+- `.python-version` — pins Python 3.11 for build consistency
+
+Railway will start the app with:
+```bash
+uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
 ## Project Structure
 
 ```
@@ -212,6 +231,8 @@ document-extractor/
 ├── requirements.txt   # Pinned Python dependencies
 ├── .env.example       # Environment variable template
 ├── __init__.py        # Package marker
+├── railway.toml       # Railway deployment configuration
+├── .python-version    # Python runtime version for deployment
 └── README.md          # This file
 ```
 

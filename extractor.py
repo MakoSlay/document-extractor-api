@@ -17,7 +17,8 @@ import time
 from typing import Optional
 
 import fitz  # pymupdf
-from openai import OpenAI
+import httpx
+from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 from PIL import Image
 
 from models import ExtractionResponse
@@ -69,7 +70,11 @@ EXTRACTION_PROMPT = (
 def _get_client() -> OpenAI:
     """Create a configured OpenAI client pointed at the standard API."""
     api_key = os.environ.get("OPENAI_API_KEY", "")
-    return OpenAI(api_key=api_key, base_url=OPENAI_BASE_URL)
+    return OpenAI(
+        api_key=api_key,
+        base_url=OPENAI_BASE_URL,
+        timeout=httpx.Timeout(60.0, connect=10.0),
+    )
 
 
 def _render_pdf_page_to_png(file_data: bytes) -> bytes:
@@ -290,8 +295,19 @@ def extract_document(
             )
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY_SECONDS)
+        except (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError) as exc:
+            last_error = exc
+            logger.warning(
+                "Transient OpenAI API failure on attempt %d/%d | request_id=%s: %s",
+                attempt,
+                MAX_RETRIES,
+                request_id,
+                exc,
+            )
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY_SECONDS)
         except Exception as exc:
-            # Unexpected errors (network, auth, etc.) — do not retry
+            # Unexpected errors (auth, schema, SDK misuse, etc.) — do not retry
             logger.error(
                 "Unexpected API error for request_id=%s: %s",
                 request_id,

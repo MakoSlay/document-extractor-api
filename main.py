@@ -3,6 +3,10 @@ FastAPI application for document extraction via GPT-4o-mini.
 
 Provides a /extract endpoint that accepts PDF/image uploads, validates them,
 caches results by content hash, and returns structured JSON via AI vision.
+
+Important deployment note: this service is designed to run with a single
+application worker so the in-memory cache and concurrency semaphore remain
+authoritative.
 """
 
 import asyncio
@@ -178,22 +182,27 @@ async def extract(file: UploadFile = File(...)):
             detail=f"Unsupported file extension '.{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
         )
 
-    # ---- Step 2: Read file content ----
-    file_data = await file.read()
+    # ---- Step 2: Read file content with streaming size enforcement ----
+    chunks: list[bytes] = []
+    file_size = 0
+    while chunk := await file.read(1024 * 1024):  # 1 MB chunks
+        file_size += len(chunk)
+        if file_size > MAX_FILE_SIZE_BYTES:
+            logger.warning(
+                "File too large while streaming | request_id=%s | filename=%s | size=%d",
+                request_id,
+                file.filename,
+                file_size,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"File size ({file_size / 1024 / 1024:.1f} MB) exceeds the 10 MB limit",
+            )
+        chunks.append(chunk)
+    file_data = b"".join(chunks)
+    await file.close()
 
     # ---- Step 3: File size validation ----
-    file_size = len(file_data)
-    if file_size > MAX_FILE_SIZE_BYTES:
-        logger.warning(
-            "File too large | request_id=%s | filename=%s | size=%d",
-            request_id,
-            file.filename,
-            file_size,
-        )
-        raise HTTPException(
-            status_code=400,
-            detail=f"File size ({file_size / 1024 / 1024:.1f} MB) exceeds the 10 MB limit",
-        )
     if file_size == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
@@ -323,12 +332,13 @@ async def extract(file: UploadFile = File(...)):
                 detail="Server busy, please retry shortly",
             )
 
-        # ---- Step 8: Call extraction ----
+        # ---- Step 8: Call extraction off the event loop ----
         try:
-            extraction_result, prompt_tokens, completion_tokens = extract_document(
-                file_data=file_data,
-                mime_type=detected_mime,
-                request_id=request_id,
+            extraction_result, prompt_tokens, completion_tokens = await asyncio.to_thread(
+                extract_document,
+                file_data,
+                detected_mime,
+                request_id,
             )
         except ValueError as exc:
             logger.error(
@@ -392,4 +402,5 @@ async def extract(file: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=4000, reload=True)
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
